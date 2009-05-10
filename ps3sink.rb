@@ -1,8 +1,17 @@
 class Ps3sink
-  DEBUG = false
+  begin
+    Shoes
+    has_shoes = true
+  rescue
+    has_shoes = false
+  end
   
-  SPLIT = '-split'
+  SPLIT = 'split'
   FOUR_GB = 1024**3*4 # file limit of non 64bit filesystems
+  DESTINATIONS = {
+    :tv => '/Users/vrinek/Movies/TV/',
+    :film => '/Users/vrinek/Movies/film/'
+  }
   
   INFO = {
     :number => /Track number/,
@@ -16,10 +25,10 @@ class Ps3sink
     :channels => /Channels/
   }
   
-  def initialize(root)
-    @root = root.gsub(/([^\/])$/, '\\1/')
-    filename = `ls '#{@root}'`.split(/\n/).select{|f| f =~ /mkv$/}.reject{|f| f =~ /#{SPLIT}.\d+\.mkv/}[0]
-    puts @file = (@root + filename)
+  def initialize(file, new_name = nil)
+    @root = File.dirname(file) + '/'
+    @file = file
+    @new_name = new_name || propose_name
   end
   
   def check_for_programs
@@ -55,22 +64,27 @@ class Ps3sink
       @tracks << track
     end
     
-    puts 'Got info from mkv'
+    info 'Got info from mkv'
+    debug @tracks.inspect
   end
   
   def video_track
     @tracks.select{|t| t[:type] == 'video'}[0]
   end
   
+  def audio_track
+    @tracks.select{|t| t[:type] == 'audio'}[0]
+  end
+  
   def split(file = @file)
     if (size = File.size(file)) > FOUR_GB
       unless (splits = ls(/#{SPLIT}.\d+\.mkv/)).empty?
-        puts 'Found splits, checking size...'
+        info 'Found splits, checking size...'
         sum = 0
         splits.each{|s| sum += File.size(@root + s)}
         
         if sum < size
-          puts 'Total filesize does not match, need to split again'
+          info 'Total filesize does not match, need to split again'
           do_split = true
           cleanup :splits
         end
@@ -84,30 +98,38 @@ class Ps3sink
         raise 'Could not calculate chunk sizes for split' unless chunk_size * chunks >= size
         megs = (chunk_size/(1024**2).to_f).ceil
 
-        cmd = "mkvmerge -o '#{file.gsub(/\.mkv$/, "#{SPLIT}.mkv")}' --split #{megs}M '#{file}'"
+        cmd = "mkvmerge -o '#{@root}#{SPLIT}.mkv' --split #{megs}M '#{file}'"
         system cmd
       else
-        puts 'File is already split'
+        info 'File is already split'
         return true
       end
     else
-      puts 'Filesize less than 4GB. No need to split'
+      info 'Filesize less than 4GB. No need to split'
       return false
     end
   end
 
   def get_audio(file = @file)
-    cmd = "ffmpeg -i '#{file}' -vn -ac 2 -acodec libfaac -ab 128k -threads 2 '#{@root}audio.aac'"
-    system cmd
+    info 'Getting the audio track...'
+    if audio_track[:codec] =~ /^A.DTS$/ # ffmpeg does not detect dts streams properly
+      info 'Detected DTS audio track. Using AudialHub ffmpeg binary...'
+      raise 'Could not extract audio to WAV' unless system "'/Library/Application Support/Techspansion/ah104ffmpeg' -y -i '#{file}' -ac 2 -acodec pcm_s16le '#{@root}audio.temp.wav'"
+      
+      raise 'Could not convert audio to AAC' unless system "ffmpeg -y -i '#{@root}audio.temp.wav' -ac 2 -acodec libfaac -ab 128k '#{@root}audio.aac'"
+    else
+      system "ffmpeg -i '#{file}' -vn -ac 2 -acodec libfaac -ab 128k '#{@root}audio.aac'"
+    end
   end
   
   def get_video(file = @file)
+    info 'Getting the video track...'
     cmd = "mkvextract tracks '#{file}' #{video_track[:number]}:'#{@root}video.h264'"
     system cmd
   end
   
   def correct_video_profile
-    puts 'Correcting the video profile...'
+    info 'Correcting the video profile...'
     v = File.open(@root+'video.h264', 'r+')
     v.seek 7
     v.putc 0x29
@@ -116,43 +138,70 @@ class Ps3sink
   
   def mux_mp4
     if system("which mp4box")
-      puts 'Creating mp4 using mp4box...'
+      info 'Creating mp4 using mp4box...'
       cmd = "mp4box -add '#{@root}video.h264' -add '#{@root}audio.aac' -fps #{video_track[:fps]} -hint '#{@root}file.mp4'"
-      system cmd
+      raise 'Could not mux MP4' unless system cmd
     elsif system("which mp4creator")
-      puts 'Adding the video to the mp4...'
+      info 'Adding the video to the mp4...'
       cmd = "mp4creator -create='#{@root}video.h264' -rate=#{video_track[:fps]} '#{@root}file.mp4'"
       system cmd
 
-      puts 'Hinting the mp4...'
+      info 'Hinting the mp4...'
       cmd = "mp4creator -hint=1 '#{@root}file.mp4'"
       system cmd
 
-      puts 'Adding the audio, interleaving and optimising...'
+      info 'Adding the audio, interleaving and optimising...'
       cmd = "mp4creator -c '#{@root}audio.aac' -interleave -optimize '#{@root}file.mp4'"
       system cmd
     end
   end
   
   def rename_mp4(file = nil)
-    puts (new_name = @root.split(/\//).last.gsub(/ +NZB$/, '').gsub(/\.?(720p|1080p).*?$/i, '').gsub(/\./, ' ').gsub(/(s\d{2}e\d{2}|\d{4})/i, '- \\1')).inspect
-    
     if file =~ /#{SPLIT}/
-      new_name += '-' + file.scan(/#{SPLIT}.(\d+)/).to_s
+      new_name = @new_name + '-' + file.scan(/#{SPLIT}.(\d+)/).to_s
+    else
+      new_name = @new_name
     end
     
-    cmd = "mv '#{@root}file.mp4' '#{@root+new_name}.mp4'"
-    system cmd
+    new_root = @root
+    new_root = DESTINATIONS[:tv] if @new_name =~ /s\d{2}e\d{2}/i
+    new_root = DESTINATIONS[:film] if @new_name =~ /\(\d{4}\)/
+    
+    system cmd = "mv '#{@root}file.mp4' '#{new_root+new_name}.mp4'"
+  end
+  
+  def propose_name
+    folder = @root.gsub(/\/$/, '').split(/\//).last
+    file = @file.split(/\//).last.gsub(/\.mkv$/, '')
+
+    if folder.length > file.length
+      name = folder
+    else
+      name = file
+    end
+
+    name.gsub!(/(\\? )+NZB$/, '')
+    name.gsub!(/\\/, '')
+    name.gsub!(/^\[\d+\]-\[.*?@efnet\]-(.*?)-\[\d+_\d+\].*?$/i, '\1') # standard @efnet naming
+    name.gsub!(/\\ /, ' ')
+    name.gsub!(/(720p|1080p|efnet)/, '')
+    name.gsub!(/\.nfo$/, '')
+    name.gsub!(/([^\d])(\d{4})([^\d]).*?$/, '\1(\2)\3') if name =~ /\.\d{4}\./
+    name.gsub!(/s(\d{2}).?e(\d{2}).*?$/i, ' - S\1E\2') if name =~ /s\d{2}.?e\d{2}/i
+    name.gsub!(/\./, ' ')
+    name.gsub!(/ +/, ' ')
+    name.strip!
+
+    return name
   end
   
   def automagick
-    check_for_programs unless DEBUG
+    check_for_programs
     
     mkvinfo
-    puts @tracks.inspect
     
     if split
-      puts @files = ls(/#{SPLIT}.\d+\.mkv$/).collect{|f| @root + f}
+      debug (@files = ls(/#{SPLIT}.\d+\.mkv$/).collect{|f| @root + f}).inspect
     else
       @files = [@file]
     end
@@ -171,52 +220,13 @@ class Ps3sink
     cleanup :splits
   end
   
-  def ls(select = nil, reject = nil)
-    ls = `ls '#{@root}'`.split(/\n/)
-    ls = ls.select{|f| f =~ select} if select
-    ls = ls.reject{|f| f =~ reject} if reject
-    return ls
-  end
-  
-  def cleanup(which = :all)
-    split_regexp = /#{SPLIT}.\d+\.mkv$/
-    case which
-    when :splits
-      puts 'Trashing the splits...'
-      trash ls(split_regexp)
-    when :mkv
-      puts 'Trashing the original MKV...'
-      trash ls(/\.mkv$/, split_regexp)
-    when :audio
-      puts 'Trashing the extracted audio'
-      trash ls(/^audio\.(aac|m4a)$/)
-    when :video
-      puts 'Trashing the extracted video'
-      trash ls(/^video\.h264$/)
-    when :all
-      cleanup :splits
-      cleanup :mkv
-      cleanup :audio
-      cleanup :video
+  unless has_shoes
+    def info(text)
+      puts text
     end
-  end
-  
-  def trash(array_or_filename)
-    [array_or_filename].flatten.each{ |file|
-      cmd = "mv '#{@root+file}' ~/.Trash/"
-      system cmd
-    }
-  end
-  
-  if DEBUG
-    def system(command)
-      puts command
+
+    def debug(text)
+      puts text
     end
   end
 end
-
-# ROOT = "/Users/vrinek/Downloads/How.I.Met.Your.Mother.S04E22.720p.HDTV.X264-DIMENSION  NZB/"
-ROOT = "/Users/vrinek/Movies/ps3"
-
-ps = Ps3sink.new ROOT
-ps.automagick
