@@ -1,0 +1,8 @@
+WARNING
+This is by no means a working piece of code. It isn't even alpha yet.
+To make it work on another box, it will need a lot of tweaking.
+
+TODO
+add a config file
+automate tools installation
+make output a lot less verbose
